@@ -88,38 +88,67 @@ def _parse_qty(q) -> Optional[float]:
     except:
         return None
 
-HEADER_HINTS_DESC = ["descr", "description", "material", "item", "especifica"]
-HEADER_HINTS_UNIT = ["und", "unid", "unit"]
-HEADER_HINTS_QTY  = ["qtd", "qtde", "quant", "qty", "quantity"]
+HEADER_HINTS_ITEM = ["item", "itens", "it.", "cód", "codigo", "code", "cod"]
+HEADER_HINTS_DESC = ["descr", "descrição", "description", "material", "especifica", "specification"]
+HEADER_HINTS_UNIT = ["und", "unid", "unidade", "unit"]
+HEADER_HINTS_QTY  = ["qtd", "qtde", "quant", "quantidade", "qty", "quantity"]
 
-def _detect_header_and_cols(ws, max_scan_rows: int = 40) -> Optional[Tuple[int, int, int]]:
+
+def _detect_header_and_cols(ws, max_scan_rows: int = 60):
     """
-    Heurística simples:
-    procura uma linha de cabeçalho que contenha indícios para descrição e quantidade.
-    Retorna (header_row_index, desc_col_index, unit_col_index, qty_col_index)
-    (col_index é 1-based como openpyxl)
+    Retorna (header_row, item_col, desc_col, unit_col, qty_col)
+    col_index é 1-based (openpyxl). Se não achar algum, retorna -1.
     """
-    best = None
+    max_col = min(ws.max_column, 80)
+
     for r in range(1, min(max_scan_rows, ws.max_row) + 1):
         row_vals = []
-        for c in range(1, min(ws.max_column, 60) + 1):
+        for c in range(1, max_col + 1):
             v = _to_str(ws.cell(row=r, column=c).value).lower()
             row_vals.append(v)
 
-        # score
+        # candidatos
+        item_cols = [i+1 for i, v in enumerate(row_vals) if any(h in v for h in HEADER_HINTS_ITEM)]
         desc_cols = [i+1 for i, v in enumerate(row_vals) if any(h in v for h in HEADER_HINTS_DESC)]
         qty_cols  = [i+1 for i, v in enumerate(row_vals) if any(h in v for h in HEADER_HINTS_QTY)]
         unit_cols = [i+1 for i, v in enumerate(row_vals) if any(h in v for h in HEADER_HINTS_UNIT)]
 
-        if desc_cols and qty_cols:
-            # pega o primeiro indício de cada
-            desc_col = desc_cols[0]
-            qty_col = qty_cols[0]
-            unit_col = unit_cols[0] if unit_cols else None
+        if not qty_cols:
+            continue
 
-            best = (r, desc_col, unit_col or -1, qty_col)
-            break
-    return best
+        # tenta escolher desc_col de verdade
+        desc_col = desc_cols[0] if desc_cols else -1
+        qty_col = qty_cols[0]
+        unit_col = unit_cols[0] if unit_cols else -1
+        item_col = item_cols[0] if item_cols else -1
+
+        # se desc_col não achou, tenta inferir: coluna com texto mais longo nas próximas linhas
+        if desc_col == -1:
+            best_c = -1
+            best_len = 0
+            for c in range(1, max_col + 1):
+                total_len = 0
+                samples = 0
+                for rr in range(r+1, min(r+15, ws.max_row) + 1):
+                    v = _to_str(ws.cell(row=rr, column=c).value)
+                    if v:
+                        total_len += len(v)
+                        samples += 1
+                avg_len = (total_len / samples) if samples else 0
+                if avg_len > best_len:
+                    best_len = avg_len
+                    best_c = c
+            desc_col = best_c if best_c != -1 else -1
+
+        # proteção: desc_col não pode ser a mesma que item_col (quando o header é "Item")
+        if desc_col == item_col and desc_col != -1:
+            # tenta pegar outro candidato de descrição
+            if len(desc_cols) > 1:
+                desc_col = desc_cols[1]
+
+        return (r, item_col, desc_col, unit_col, qty_col)
+
+    return None
 
 def _material_key(desc_final: str, unit_norm: str) -> str:
     # chave simples p/ MVP (depois vai evoluir)
@@ -296,17 +325,21 @@ def _process_run_background(run_id: str):
                 if not header:
                     continue  # MVP: ignora abas sem cabeçalho identificado
 
-                header_row, desc_col, unit_col, qty_col = header
+                header_row, item_col, desc_col, unit_col, qty_col = header
 
                 for r in range(header_row + 1, ws.max_row + 1):
-                    desc_raw = _to_str(ws.cell(row=r, column=desc_col).value)
+                    item_code = _to_str(ws.cell(row=r, column=item_col).value) if item_col != -1 else ""
+                    desc_raw = _to_str(ws.cell(row=r, column=desc_col).value) if desc_col != -1 else ""
                     unit_raw = _to_str(ws.cell(row=r, column=unit_col).value) if unit_col != -1 else ""
-                    qty_raw = _to_str(ws.cell(row=r, column=qty_col).value)
+                    qty_raw  = _to_str(ws.cell(row=r, column=qty_col).value)
 
                     qty_num = _parse_qty(qty_raw)
                     unit_norm = _normalize_unit(unit_raw)
 
-                    include = bool(desc_raw) and (qty_num is not None) and (qty_num > 0)
+                    def _has_letter(s: str) -> bool:
+                        return bool(re.search(r"[A-Za-zÀ-ÿ]", s or ""))
+
+                    include = bool(desc_raw) and _has_letter(desc_raw) and (qty_num is not None) and (qty_num > 0)
 
                     raw_row = {
                         "run_id": run_id,
